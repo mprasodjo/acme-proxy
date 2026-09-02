@@ -1,6 +1,7 @@
 package externalcas
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -116,21 +117,19 @@ func (c *certMetaCollector) Collect(ch chan<- prometheus.Metric) {
 
 // StartMetricsServer starts the Prometheus metrics HTTP server once.
 // DataSource is guaranteed non-empty by AcmeProxyConfig.Validate() when enabled.
-// Returns an error if the cert store cannot be opened — this fails server startup.
+// The cert store must already be opened (globalStore) by New(); this fails
+// server startup when it is missing.
 func StartMetricsServer(m metrics, caURL string) error {
 	if !m.Enabled {
 		return nil
 	}
 	var startErr error
 	metricsServerOnce.Do(func() {
-		s, err := newCertStore(m.DataSource)
-		if err != nil {
-			startErr = fmt.Errorf("failed to open cert store: %w", err)
+		if globalStore == nil {
+			startErr = errors.New("cert store not initialized")
 			return
 		}
-		globalStore = s
-
-		if err := registry.Register(newCertMetaCollector(s)); err != nil {
+		if err := registry.Register(newCertMetaCollector(globalStore)); err != nil {
 			startErr = fmt.Errorf("failed to register cert meta collector: %w", err)
 			return
 		}
@@ -162,9 +161,16 @@ func StartMetricsServer(m metrics, caURL string) error {
 
 // runCAHealthProbe periodically GETs caURL and updates externalCAStatus.
 // A 2xx response sets the gauge to 1 (up); any error or non-2xx sets it to 0 (down).
-func runCAHealthProbe(caURL string, interval time.Duration) {
+func runCAHealthProbe(initialURL string, interval time.Duration) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	probe := func() {
+		caURL := initialURL
+		// Honor hot-reloaded ca_url.
+		if cas := currentCAS.Load(); cas != nil {
+			if u := cas.conf().CaURL; u != "" {
+				caURL = u
+			}
+		}
 		resp, err := client.Get(caURL) //nolint:noctx
 		if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			externalCAStatus.WithLabelValues(caURL).Set(0)
