@@ -49,7 +49,7 @@ func New(ctx context.Context, opts apiv1.Options) (*ExternalCAS, error) {
 	cas.cfg.Store(cfg)
 	currentCAS.Store(cas)
 
-	// Top-level ca.json blocks (dashboard, acl) — outside "authority".
+	// Top-level ca.json blocks (dashboard, acl), outside "authority".
 	top := loadTopLevelConfig()
 	if err := top.Dashboard.validate(cfg.Metrics); err != nil {
 		return nil, err
@@ -86,6 +86,10 @@ func New(ctx context.Context, opts apiv1.Options) (*ExternalCAS, error) {
 				return nil, fmt.Errorf("failed to open cert store: %w", err)
 			}
 			globalStore = s
+			// Opportunistic startup prune (no-op on the 24h cadence inside).
+			if err := s.Prune(time.Now()); err != nil {
+				slog.Warn("startup store prune failed", "error", err)
+			}
 		}
 	}
 
@@ -150,6 +154,11 @@ type ExternalCAS struct {
 	acctMu  sync.Mutex
 	account *User
 
+	// lastRegFail is the time of the most recent failed account registration
+	// (guarded by acctMu); registration retries back off for 5 minutes so a
+	// broken CA is not hammered (and keys regenerated) on every request.
+	lastRegFail time.Time
+
 	// newACMEClient builds an ACMEClient; overridable in tests.
 	newACMEClient func(*acmeProxyConfig) (ACMEClient, error)
 }
@@ -160,8 +169,9 @@ func (c *ExternalCAS) Type() apiv1.Type {
 
 // getOrCreateAccount returns the cached ACME account, registering a new one
 // (with a fresh ECDSA key) the first time it is called. Registration happens
-// at most once per process; on failure nothing is cached so the next request
-// retries.
+// at most once per process; on failure nothing is cached and further
+// registration attempts back off for 5 minutes (no key generation, no CA
+// contact) so an unreachable or broken CA cannot be hammered per request.
 func (c *ExternalCAS) getOrCreateAccount() (*User, error) {
 	c.acctMu.Lock()
 	defer c.acctMu.Unlock()
@@ -169,10 +179,18 @@ func (c *ExternalCAS) getOrCreateAccount() (*User, error) {
 	if c.account != nil {
 		return c.account, nil
 	}
+	if !c.lastRegFail.IsZero() && time.Since(c.lastRegFail) < 5*time.Minute {
+		return nil, errors.New("ACME account registration recently failed; backing off")
+	}
+
+	regFailed := func(err error) (*User, error) {
+		c.lastRegFail = time.Now()
+		return nil, err
+	}
 
 	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate ECDSA key: %w", err)
+		return regFailed(fmt.Errorf("failed to generate ECDSA key: %w", err))
 	}
 
 	user := &User{
@@ -191,10 +209,10 @@ func (c *ExternalCAS) getOrCreateAccount() (*User, error) {
 	// Create lego client
 	client, err := lego.NewClient(clientConfig)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create lego client: %w", err)
+		return regFailed(fmt.Errorf("failed to create lego client: %w", err))
 	}
 
-	// Account registration — EAB takes precedence when configured
+	// Account registration; EAB when configured
 	regStart := time.Now()
 	if c.conf().useEAB {
 		reg, err := client.Registration.RegisterWithExternalAccountBinding(c.ctx, registration.RegisterEABOptions{
@@ -206,7 +224,7 @@ func (c *ExternalCAS) getOrCreateAccount() (*User, error) {
 			acmeRoundtripDuration.WithLabelValues("register").Observe(time.Since(regStart).Seconds())
 		}
 		if err != nil {
-			return nil, fmt.Errorf("lego acme client registration failed with CA: %w", err)
+			return regFailed(fmt.Errorf("lego acme client registration failed with CA: %w", err))
 		}
 		user.Registration = reg
 	} else {
@@ -217,12 +235,13 @@ func (c *ExternalCAS) getOrCreateAccount() (*User, error) {
 			acmeRoundtripDuration.WithLabelValues("register").Observe(time.Since(regStart).Seconds())
 		}
 		if err != nil {
-			return nil, fmt.Errorf("lego acme client registration failed with CA: %w", err)
+			return regFailed(fmt.Errorf("lego acme client registration failed with CA: %w", err))
 		}
 		user.Registration = reg
 	}
 
 	c.account = user
+	c.lastRegFail = time.Time{}
 	return user, nil
 }
 
@@ -276,6 +295,16 @@ func (c *ExternalCAS) createLegoClient(cfg *acmeProxyConfig) (ACMEClient, error)
 	return &legoClientAdapter{certClient: client.Certificate}, nil
 }
 
+// truncStr bounds a persisted detail string to max runes so a chatty
+// upstream error cannot bloat the store or dashboard payloads.
+func truncStr(s string, maxRunes int) string {
+	r := []rune(s)
+	if len(r) <= maxRunes {
+		return s
+	}
+	return string(r[:maxRunes])
+}
+
 // recordIssue persists an issuance record to the sidecar store when open.
 func recordIssue(r CertRecord) {
 	if globalStore == nil {
@@ -306,22 +335,25 @@ func (c *ExternalCAS) CreateCertificate(req *apiv1.CreateCertificateRequest) (*a
 	// Consumed once, before singleflight, so coalesced requests share it.
 	clientIP := reqmeta.LookupFinalize(req.CSR)
 
-	// Check certificate cache before requesting from external CA.
-	// The cached leaf must carry the CSR's public key: a certificate is
-	// bound to its key, and callers (e.g. step-ca bootstrap) may present
-	// a fresh key on every start.
+	// Check the certificate cache first. Serve only when the leaf matches
+	// the CSR public key; step-ca bootstraps with a fresh key every start.
 	if globalStore != nil && len(req.CSR.DNSNames) > 0 {
-		if cached := globalStore.findCachedCert(req.CSR.DNSNames); cached != nil && cached.matchesCSR(req.CSR) && cacheFreshEnough(cached, c.conf()) {
-			remaining := time.Until(cached.ExpiresAt)
-			slog.Info("returning cached certificate",
-				"domains", req.CSR.DNSNames,
-				"serial", cached.Serial,
-				"expires", cached.ExpiresAt.Format(time.RFC3339),
-				"remaining", remaining.Round(time.Second))
-			if metricsEnabled {
-				certificatesIssuedTotal.WithLabelValues("cache_hit").Inc()
+		if cached := globalStore.findCachedCert(req.CSR.DNSNames); cached != nil && cached.matchesCSR(req.CSR) {
+			if cacheFreshEnough(cached, c.conf()) {
+				remaining := time.Until(cached.ExpiresAt)
+				slog.Info("returning cached certificate",
+					"domains", req.CSR.DNSNames,
+					"serial", cached.Serial,
+					"expires", cached.ExpiresAt.Format(time.RFC3339),
+					"remaining", remaining.Round(time.Second))
+				if metricsEnabled {
+					certificatesIssuedTotal.WithLabelValues("cache_hit").Inc()
+				}
+				return cached.toResponse()
 			}
-			return cached.toResponse()
+			// Key-matching entry that can no longer be served: drop it now
+			// so future lookups stop finding it.
+			globalStore.dropCachedIfStale(req.CSR.DNSNames, c.conf())
 		}
 	}
 
@@ -337,8 +369,11 @@ func (c *ExternalCAS) CreateCertificate(req *apiv1.CreateCertificateRequest) (*a
 		// already cached the certificate. Key match is required for the
 		// same reason as the outer check.
 		if globalStore != nil && len(req.CSR.DNSNames) > 0 {
-			if cached := globalStore.findCachedCert(req.CSR.DNSNames); cached != nil && cached.matchesCSR(req.CSR) && cacheFreshEnough(cached, c.conf()) {
-				return cached.toResponse()
+			if cached := globalStore.findCachedCert(req.CSR.DNSNames); cached != nil && cached.matchesCSR(req.CSR) {
+				if cacheFreshEnough(cached, c.conf()) {
+					return cached.toResponse()
+				}
+				globalStore.dropCachedIfStale(req.CSR.DNSNames, c.conf())
 			}
 		}
 
@@ -425,7 +460,7 @@ func (c *ExternalCAS) CreateCertificate(req *apiv1.CreateCertificateRequest) (*a
 					DurationSeconds: result.duration.Seconds(),
 					Status:          "failure",
 					ClientIP:        clientIP,
-					Error:           result.err.Error(),
+					Error:           truncStr(result.err.Error(), 512),
 				})
 				return nil, result.err
 			}
@@ -477,7 +512,7 @@ func (c *ExternalCAS) CreateCertificate(req *apiv1.CreateCertificateRequest) (*a
 				SANs:       strings.Join(req.CSR.DNSNames, ","),
 				Status:     "failure",
 				ClientIP:   clientIP,
-				Error:      fmt.Sprintf("certificate request timed out: %v", ctx.Err()),
+				Error:      truncStr(fmt.Sprintf("certificate request timed out: %v", ctx.Err()), 512),
 			})
 			return nil, fmt.Errorf("certificate request timed out: %w", ctx.Err())
 		}
@@ -562,7 +597,7 @@ func (c *ExternalCAS) RevokeCertificate(req *apiv1.RevokeCertificateRequest) (*a
 			DurationSeconds: revokeDuration.Seconds(),
 			Status:          "failure",
 			ClientIP:        clientIP,
-			Error:           revokeErr.Error(),
+			Error:           truncStr(revokeErr.Error(), 512),
 		})
 		return nil, fmt.Errorf("failed to revoke certificate: %w", revokeErr)
 	}

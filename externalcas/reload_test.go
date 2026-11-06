@@ -40,6 +40,39 @@ func setupSettingsEnv(t *testing.T) string {
 	return cfgFile
 }
 
+// GET /api/settings must never leak the EAB HMAC key: it is masked with the
+// same sentinel as dashboard.password (PUT treats the sentinel as unchanged).
+func TestCurrentSettings_MasksEABHMACKey(t *testing.T) {
+	setupSettingsEnv(t)
+
+	cas := currentCAS.Load()
+	cfg := cas.conf()
+	cfg.Kid = "kid-1"
+	cfg.HmacKey = "super-secret-hmac"
+	cas.cfg.Store(cfg)
+
+	s, err := currentSettings()
+	if err != nil {
+		t.Fatalf("currentSettings: %v", err)
+	}
+	auth := s["authority"].(map[string]any)["config"].(map[string]any)
+	if got := auth["eab_hmac_key"]; got != secretMask {
+		t.Errorf("eab_hmac_key = %v, want masked %q", got, secretMask)
+	}
+
+	// An unset key stays empty (mask only applies to real secrets).
+	cfg.HmacKey = ""
+	cas.cfg.Store(cfg)
+	s, err = currentSettings()
+	if err != nil {
+		t.Fatalf("currentSettings: %v", err)
+	}
+	auth = s["authority"].(map[string]any)["config"].(map[string]any)
+	if got := auth["eab_hmac_key"]; got != "" {
+		t.Errorf("empty eab_hmac_key = %v, want empty string", got)
+	}
+}
+
 func TestSaveSettings_MergeValidateApply(t *testing.T) {
 	cfgFile := setupSettingsEnv(t)
 

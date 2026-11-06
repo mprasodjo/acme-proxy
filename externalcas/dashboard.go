@@ -43,10 +43,22 @@ const (
 	dashboardSessionTTL = 12 * time.Hour
 )
 
+// Login brute-force lockout: per-IP failure counter with a temporary lock.
+const (
+	dashLoginMaxFails   = 5
+	dashLoginLockout    = 5 * time.Minute
+	dashLoginTrackerCap = 4096
+)
+
 var (
 	dashOnce       sync.Once
 	dashSessions   = map[string]time.Time{} // token -> expiry
 	dashSessionsMu sync.Mutex
+
+	// dashLoginFailures tracks per-client-IP failed login attempts; at
+	// dashLoginMaxFails within a lockout window the IP is locked out.
+	dashLoginMu       sync.Mutex
+	dashLoginFailures = map[string]dashLoginState{}
 
 	// dashCreds holds the active login credentials; hot-swapped by the
 	// settings reload without restarting the listener.
@@ -56,7 +68,17 @@ var (
 	// dashCfg holds the active dashboard config (tls_max_age_days etc.) for
 	// the renewal loop; hot-swapped by the settings reload.
 	dashCfgPtr atomic.Pointer[dashboard]
+
+	// dashMaintOnce guards the hourly dashboard maintenance goroutine so
+	// re-instantiation (SIGHUP reload → New) cannot start a second one.
+	dashMaintOnce sync.Once
 )
+
+// dashLoginState is the per-IP login throttle state.
+type dashLoginState struct {
+	fails       int
+	lockedUntil time.Time
+}
 
 // setDashCreds swaps the active dashboard credentials (empty fields keep the
 // current value).
@@ -163,15 +185,24 @@ func startDashboardServer(cas *ExternalCAS, cfg *acmeProxyConfig, d dashboard) e
 		startErr = restartDashboardListener(d)
 	}
 	if startErr == nil {
-		go func() {
-			// Immediate pass (drives renewal / retry), then hourly.
-			maintainDashTLS(cas, cfg, d)
-			ticker := time.NewTicker(time.Hour)
-			defer ticker.Stop()
-			for range ticker.C {
-				maintainDashTLS(cas, cfg, getDashConfig())
-			}
-		}()
+		dashMaintOnce.Do(func() {
+			go func() {
+				// Immediate pass (drives renewal / retry), then hourly.
+				maintainDashTLS(cas, cfg, d)
+				ticker := time.NewTicker(time.Hour)
+				defer ticker.Stop()
+				for range ticker.C {
+					maintainDashTLS(cas, cfg, getDashConfig())
+					// Opportunistic store prune; Prune itself enforces a
+					// 24h cadence, so this is cheap when there is nothing to do.
+					if globalStore != nil {
+						if err := globalStore.Prune(time.Now()); err != nil {
+							slog.Debug("cert store prune failed", "error", err)
+						}
+					}
+				}
+			}()
+		})
 	}
 	return startErr
 }
@@ -180,18 +211,44 @@ var (
 	dashMux    *http.ServeMux
 	dashSrvMu  sync.Mutex
 	dashSrv    *http.Server
+	dashAddr   string // address dashSrv is bound to ("" before first bind)
+	dashSrvTLS bool   // whether dashSrv serves TLS
 	dashTLSCfg atomic.Pointer[tls.Config]
 )
+
+// dashSecurityHeaders sets defensive response headers on every dashboard
+// response (page and API). The page is fully inline (no external assets), so
+// the CSP needs 'unsafe-inline' for script/style; applying the same headers
+// to API responses is harmless and keeps the middleware uniform.
+func dashSecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("Cache-Control", "no-store")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+		next.ServeHTTP(w, r)
+	})
+}
 
 // restartDashboardListener binds a dashboard listener for d's address using
 // the active TLS config and drains the previous one. Called at startup and by
 // the settings reload when port/bind/TLS files change. A bind failure leaves
-// the previous listener serving.
+// the previous listener serving. When neither the address nor the TLS mode
+// changed, this is a no-op: the old listener keeps serving (a SIGHUP reload
+// re-instantiates the CA and would otherwise hit EADDRINUSE rebinding the
+// same address while the previous listener is still draining).
 func restartDashboardListener(d dashboard) error {
 	dashSrvMu.Lock()
 	defer dashSrvMu.Unlock()
 
 	addr := net.JoinHostPort(d.Bind, strconv.Itoa(d.Port))
+	tlsConf := dashTLSCfg.Load()
+	if dashSrv != nil && addr == dashAddr && (tlsConf != nil) == dashSrvTLS {
+		slog.Debug("dashboard listener unchanged; keeping current listener", "addr", addr)
+		return nil
+	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("cannot bind dashboard listener %s: %w", addr, err)
@@ -204,13 +261,18 @@ func restartDashboardListener(d dashboard) error {
 			_ = old.Shutdown(ctx)
 		}()
 	}
-	tlsConf := dashTLSCfg.Load()
 	srv := &http.Server{
-		Handler:           dashMux,
+		Handler: dashSecurityHeaders(dashMux),
+		// Close idle keep-alives before NAT tables forget them.
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 		TLSConfig:         tlsConf,
 	}
 	dashSrv = srv
+	dashAddr = addr
+	dashSrvTLS = tlsConf != nil
 	go func() {
 		var err error
 		if tlsConf != nil {
@@ -244,7 +306,10 @@ func reloadManualDashTLS(d dashboard) error {
 	if err != nil {
 		return fmt.Errorf("dashboard tls_cert/tls_key: %w", err)
 	}
-	dashTLSCfg.Store(&tls.Config{Certificates: []tls.Certificate{cert}})
+	dashTLSCfg.Store(&tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	})
 	return nil
 }
 
@@ -276,7 +341,7 @@ func dashTLSConfig(cas *ExternalCAS, cfg *acmeProxyConfig, d dashboard) (*dashTL
 			return nil, fmt.Errorf("dashboard tls_cert/tls_key: %w", err)
 		}
 		return &dashTLSRuntime{
-			cfg:   &tls.Config{Certificates: []tls.Certificate{cert}},
+			cfg:   &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12},
 			renew: func() {},
 		}, nil
 	}
@@ -318,10 +383,11 @@ func dashTLSConfig(cas *ExternalCAS, cfg *acmeProxyConfig, d dashboard) (*dashTL
 	current.Store(&cert)
 
 	// Renewal: when the certificate's cache age is exhausted
-	// (tls_max_age_days) or it is close to expiry, obtain a fresh one,
-	// persist it, and swap it in atomically. The :443 listener renews
-	// through the same shared cache, so both listeners stay on one issuance
-	// cadence. A failed renewal keeps serving the previous certificate.
+	// (tls_max_age_days) or it is inside the last third of its lifetime,
+	// obtain a fresh one, persist it, and swap it in atomically. The :443
+	// listener renews through the same shared cache, so both listeners stay
+	// on one issuance cadence. A failed renewal keeps serving the previous
+	// certificate.
 	renew := func() {
 		leaf, err := x509.ParseCertificate(current.Load().Certificate[0])
 		if err != nil {
@@ -329,7 +395,11 @@ func dashTLSConfig(cas *ExternalCAS, cfg *acmeProxyConfig, d dashboard) (*dashTL
 		}
 		age := time.Since(leaf.NotBefore)
 		remaining := time.Until(leaf.NotAfter)
-		if age < maxAge() && remaining >= 14*24*time.Hour {
+		// Lifetime-relative trigger (mirrors step-ca's renewer default):
+		// renew inside the last third of the certificate's lifetime. For a
+		// 90-day cert that is the last 30 days; short-lived certs renew
+		// proportionally earlier instead of hanging on to a fixed 14 days.
+		if age < maxAge() && remaining >= leaf.NotAfter.Sub(leaf.NotBefore)/3 {
 			return
 		}
 		slog.Info("dashboard certificate past its cache age (or expiring), renewing",
@@ -338,6 +408,12 @@ func dashTLSConfig(cas *ExternalCAS, cfg *acmeProxyConfig, d dashboard) (*dashTL
 		if err != nil {
 			slog.Error("dashboard cert renewal failed; keep serving previous certificate",
 				"cn", cn, "error", err)
+			return
+		}
+		if newLeaf, err := x509.ParseCertificate(newCert.Certificate[0]); err == nil &&
+			newLeaf.SerialNumber.String() == leaf.SerialNumber.String() {
+			// Cache hit returned the certificate already being served:
+			// nothing changed, so do not rewrite files or log a renewal.
 			return
 		}
 		if err := writeCertPEM(certPath, newCert.Certificate); err != nil {
@@ -474,8 +550,23 @@ func obtainDashboardCert(cas *ExternalCAS, cn string, sans []string, key crypto.
 
 // dashLoginChecker returns a handler that validates credentials against the
 // ACTIVE values (hot-swappable via settings) and sets a session cookie.
+// Repeated failures from one client IP are throttled: after 5 bad attempts
+// the IP is locked out for 5 minutes (without disclosing the lockout).
 func dashLoginChecker() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		ip := reqmeta.RemoteIP(r)
+
+		dashLoginMu.Lock()
+		st, tracked := dashLoginFailures[ip]
+		locked := tracked && time.Now().Before(st.lockedUntil)
+		dashLoginMu.Unlock()
+		if locked {
+			time.Sleep(500 * time.Millisecond)
+			http.Error(w, "invalid username or password", http.StatusUnauthorized)
+			return
+		}
+
 		username, password := currentDashUser(), currentDashPass()
 		userHash := sha256.Sum256([]byte(username))
 		passHash := sha256.Sum256([]byte(password))
@@ -495,9 +586,24 @@ func dashLoginChecker() http.HandlerFunc {
 		if !ok {
 			// Slow down brute-force attempts.
 			time.Sleep(500 * time.Millisecond)
+			dashLoginMu.Lock()
+			st := dashLoginFailures[ip]
+			st.fails++
+			if st.fails >= dashLoginMaxFails {
+				st.lockedUntil = time.Now().Add(dashLoginLockout)
+				st.fails = 0
+			}
+			dashLoginFailures[ip] = st
+			if len(dashLoginFailures) > dashLoginTrackerCap {
+				sweepDashLoginFailuresLocked(time.Now())
+			}
+			dashLoginMu.Unlock()
 			http.Error(w, "invalid username or password", http.StatusUnauthorized)
 			return
 		}
+		dashLoginMu.Lock()
+		delete(dashLoginFailures, ip)
+		dashLoginMu.Unlock()
 		token := make([]byte, 32)
 		if _, err := rand.Read(token); err != nil {
 			http.Error(w, "internal error", http.StatusInternalServerError)
@@ -529,6 +635,33 @@ func dashLoginChecker() http.HandlerFunc {
 	}
 }
 
+// sweepDashLoginFailuresLocked bounds the login tracker: expired lockouts
+// are dropped first, then (still over cap) the oldest lockout entries in
+// one batch. Caller must hold dashLoginMu.
+func sweepDashLoginFailuresLocked(now time.Time) {
+	for ip, st := range dashLoginFailures {
+		if now.After(st.lockedUntil) {
+			delete(dashLoginFailures, ip)
+		}
+	}
+	if len(dashLoginFailures) <= dashLoginTrackerCap {
+		return
+	}
+	type kv struct {
+		ip  string
+		exp time.Time
+	}
+	all := make([]kv, 0, len(dashLoginFailures))
+	for ip, st := range dashLoginFailures {
+		all = append(all, kv{ip, st.lockedUntil})
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].exp.Before(all[j].exp) })
+	drop := len(all) - dashLoginTrackerCap
+	for _, e := range all[:drop] {
+		delete(dashLoginFailures, e.ip)
+	}
+}
+
 func dashLogout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie("acmeproxy_session"); err == nil {
 		dashSessionsMu.Lock()
@@ -541,16 +674,27 @@ func dashLogout(w http.ResponseWriter, r *http.Request) {
 // dashAuth wraps a handler with session-cookie authentication.
 func dashAuth(next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := r.Cookie("acmeproxy_session")
-		if err != nil {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
+		c, cookieErr := r.Cookie("acmeproxy_session")
 		dashSessionsMu.Lock()
-		exp, ok := dashSessions[c.Value]
-		if ok && time.Now().After(exp) {
-			delete(dashSessions, c.Value)
-			ok = false
+		var ok bool
+		if cookieErr == nil {
+			exp, present := dashSessions[c.Value]
+			if present && time.Now().After(exp) {
+				delete(dashSessions, c.Value)
+				present = false
+			}
+			ok = present
+		}
+		if !ok && len(dashSessions) > 1000 {
+			// Cheap amortized cleanup: unauthenticated scanners should not
+			// let the session map grow without bound between logins (the
+			// full sweep only runs on successful login).
+			now := time.Now()
+			for k, exp := range dashSessions {
+				if now.After(exp) {
+					delete(dashSessions, k)
+				}
+			}
 		}
 		dashSessionsMu.Unlock()
 		if !ok {
@@ -592,6 +736,28 @@ func globalStoreAllCached() []CertRecord {
 		return nil
 	}
 	return globalStore.allCached()
+}
+
+func globalStoreAllCachedMeta() []CertRecord {
+	if globalStore == nil {
+		return nil
+	}
+	return globalStore.allCachedMeta()
+}
+
+// cachedDomainSet builds a lowercase set of every individual domain covered
+// by a cached certificate, in one pass over the cache (without copying PEM
+// payloads).
+func cachedDomainSet() map[string]bool {
+	set := map[string]bool{}
+	for _, c := range globalStoreAllCachedMeta() {
+		for _, d := range strings.Split(c.SANs, ",") {
+			if d = strings.ToLower(strings.TrimSpace(d)); d != "" {
+				set[d] = true
+			}
+		}
+	}
+	return set
 }
 
 // dashView is the JSON shape served to the dashboard.
@@ -754,7 +920,8 @@ func paginate[T any](items []T, page, perPage int) []T {
 	return items[start:end]
 }
 
-// aggregateDomains groups issuance records per domain name.
+// aggregateDomains groups issuance records per domain name. cachedSans is a
+// set of lowercase individual domain names covered by cached certificates.
 func aggregateDomains(records []CertRecord, cachedSans map[string]bool) map[string]*domainSummary {
 	aggs := map[string]*domainSummary{}
 	ips := map[string]map[string]bool{}
@@ -800,13 +967,7 @@ func aggregateDomains(records []CertRecord, cachedSans map[string]bool) map[stri
 		}
 		sortStrings(agg.UniqueIPList)
 		agg.UniqueIPs = len(agg.UniqueIPList)
-		for sans := range cachedSans {
-			for _, d := range strings.Split(sans, ",") {
-				if strings.EqualFold(strings.TrimSpace(d), domain) {
-					agg.Cached = true
-				}
-			}
-		}
+		agg.Cached = cachedSans[strings.ToLower(domain)]
 	}
 	return aggs
 }
@@ -828,11 +989,7 @@ func dashCertDomains(w http.ResponseWriter, r *http.Request) {
 	page, perPage := pageParams(r)
 	q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
 
-	cachedSans := map[string]bool{}
-	for _, c := range globalStoreAllCached() {
-		cachedSans[c.SANs] = true
-	}
-	aggs := aggregateDomains(globalStoreAllIssued(), cachedSans)
+	aggs := aggregateDomains(globalStoreAllIssued(), cachedDomainSet())
 
 	list := make([]*domainSummary, 0, len(aggs))
 	for _, agg := range aggs {
@@ -879,7 +1036,7 @@ func dashCertDomainDetail(w http.ResponseWriter, r *http.Request) {
 	sort.SliceStable(views, func(i, j int) bool { return views[i].at.After(views[j].at) })
 
 	var cachedCert map[string]string
-	for _, c := range globalStoreAllCached() {
+	for _, c := range globalStoreAllCachedMeta() {
 		for _, d := range strings.Split(c.SANs, ",") {
 			if strings.EqualFold(strings.TrimSpace(d), domain) {
 				cachedCert = map[string]string{
@@ -935,7 +1092,8 @@ func dashCacheDelete(w http.ResponseWriter, r *http.Request) {
 func dashSettingsGet(w http.ResponseWriter, r *http.Request) {
 	settings, err := currentSettings()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		slog.Error("failed to build settings payload", "error", err)
+		http.Error(w, "settings unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	writeJSON(w, settings)
@@ -943,6 +1101,11 @@ func dashSettingsGet(w http.ResponseWriter, r *http.Request) {
 
 // dashSettingsPut validates, persists, and hot-applies ca.json changes.
 func dashSettingsPut(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	if !strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/json") {
+		http.Error(w, "content-type must be application/json", http.StatusUnsupportedMediaType)
+		return
+	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -954,7 +1117,15 @@ func dashSettingsPut(w http.ResponseWriter, r *http.Request) {
 		if se, ok := err.(*settingsError); ok {
 			status = se.status
 		}
-		writeJSONStatus(w, status, map[string]any{"error": err.Error()})
+		// Client-input validation messages are user-facing by design; any
+		// other failure (disk I/O, provider internals) is logged server-side
+		// only and answered with a generic message.
+		if status >= 400 && status < 500 {
+			writeJSONStatus(w, status, map[string]any{"error": err.Error()})
+			return
+		}
+		slog.Error("settings save failed", "error", err)
+		writeJSONStatus(w, status, map[string]any{"error": "settings unavailable"})
 		return
 	}
 	writeJSON(w, map[string]any{
@@ -966,7 +1137,8 @@ func dashSettingsPut(w http.ResponseWriter, r *http.Request) {
 func dashACLGet(w http.ResponseWriter, r *http.Request) {
 	content, err := acl.Content()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		slog.Error("failed to read acl file", "error", err)
+		http.Error(w, "acl unavailable", http.StatusNotFound)
 		return
 	}
 	writeJSON(w, map[string]string{
@@ -975,9 +1147,14 @@ func dashACLGet(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// dashACLPut validates and saves new ACL content. Edits take effect on the
-// next request — no daemon restart required.
+// dashACLPut validates and saves new ACL content. Edits apply on the
+// next request.
 func dashACLPut(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	if !strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/json") {
+		http.Error(w, "content-type must be application/json", http.StatusUnsupportedMediaType)
+		return
+	}
 	var body struct {
 		Content string `json:"content"`
 	}
@@ -993,7 +1170,8 @@ func dashACLPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := acl.Save(body.Content); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		slog.Error("failed to save acl file", "error", err)
+		http.Error(w, "acl unavailable", http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

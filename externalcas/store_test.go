@@ -1,17 +1,21 @@
 package externalcas
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"math/big"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	bolt "go.etcd.io/bbolt"
 )
 
 func TestNewCertStore(t *testing.T) {
@@ -170,6 +174,156 @@ func TestStoreKey(t *testing.T) {
 			t.Errorf("storeKey() = %q, want prefix %q", key, "failure:example.com:")
 		}
 	})
+
+	t.Run("failure record with RecordedAt is deterministic", func(t *testing.T) {
+		r := CertRecord{
+			CommonName: "example.com", Status: "failure",
+			RecordedAt: time.Unix(1700000000, 123456789).UTC(),
+		}
+		if !bytes.Equal(storeKey(r), storeKey(r)) {
+			t.Error("storeKey() must be deterministic for the same failure record")
+		}
+		if !strings.Contains(string(storeKey(r)), fmt.Sprint(r.RecordedAt.UnixNano())) {
+			t.Errorf("storeKey() = %q, want it to embed RecordedAt.UnixNano()", storeKey(r))
+		}
+		r2 := r
+		r2.RecordedAt = r.RecordedAt.Add(time.Second)
+		if bytes.Equal(storeKey(r2), storeKey(r)) {
+			t.Error("different RecordedAt must produce different failure keys")
+		}
+	})
+}
+
+// Regression: the cache must be bounded — inserting more than maxCachedCerts
+// domain sets evicts the oldest-expiry entry from the map AND the bucket.
+func TestCertStore_CacheCert_CapAndEviction(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+
+	for i := 0; i <= maxCachedCerts; i++ { // maxCachedCerts+1 distinct domain sets
+		domain := fmt.Sprintf("d%04d.example.com", i)
+		if err := s.cacheCert(CertRecord{
+			Serial: fmt.Sprintf("cap%04d", i), CommonName: domain, SANs: domain,
+			IssuedAt: now,
+			// First entry expires soonest and must be the eviction victim.
+			ExpiresAt: now.Add(time.Duration(i+1) * 24 * time.Hour),
+			Status:    "success", CertPEM: []byte("pem"),
+		}); err != nil {
+			t.Fatalf("cacheCert(%d): %v", i, err)
+		}
+	}
+
+	s.mu.RLock()
+	n := len(s.certCache)
+	s.mu.RUnlock()
+	if n != maxCachedCerts {
+		t.Errorf("cache size = %d, want %d", n, maxCachedCerts)
+	}
+	if s.findCachedCert([]string{"d0000.example.com"}) != nil {
+		t.Error("oldest-expiry entry should have been evicted from the map")
+	}
+	gone := true
+	if err := s.db.View(func(tx *bolt.Tx) error {
+		if tx.Bucket(cachedBucket).Get([]byte("d0000.example.com")) != nil {
+			gone = false
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !gone {
+		t.Error("evicted entry must also be deleted from the bbolt bucket")
+	}
+	if s.findCachedCert([]string{fmt.Sprintf("d%04d.example.com", maxCachedCerts)}) == nil {
+		t.Error("newest entry should still be cached")
+	}
+}
+
+func TestCertStore_Prune(t *testing.T) {
+	// Reset the 24h opportunistic cadence so this test controls Prune.
+	lastPruneMu.Lock()
+	lastPrune = time.Time{}
+	lastPruneMu.Unlock()
+
+	s := newTestStore(t)
+	now := time.Now()
+	seed := func(f func(*certStore) error) {
+		t.Helper()
+		if err := f(s); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	seed(func(s *certStore) error { // old failure (40d) — pruned
+		return s.recordIssued(CertRecord{CommonName: "old.example.com", SANs: "old.example.com",
+			Status: "failure", RecordedAt: now.Add(-40 * 24 * time.Hour), Error: "boom"})
+	})
+	seed(func(s *certStore) error { // old success (IssuedAt 200d) — pruned
+		return s.recordIssued(CertRecord{Serial: "oldsuccess", CommonName: "old.example.com",
+			IssuedAt: now.Add(-200 * 24 * time.Hour), ExpiresAt: now.Add(-10 * 24 * time.Hour), Status: "success"})
+	})
+	seed(func(s *certStore) error { // fresh success — kept
+		return s.recordIssued(CertRecord{Serial: "freshsuccess", CommonName: "fresh.example.com",
+			IssuedAt: now.Add(-24 * time.Hour), ExpiresAt: now.Add(89 * 24 * time.Hour), Status: "success"})
+	})
+	seed(func(s *certStore) error { // fresh failure — kept
+		return s.recordIssued(CertRecord{CommonName: "fresh.example.com", Status: "failure",
+			RecordedAt: now.Add(-time.Hour), Error: "boom"})
+	})
+	seed(func(s *certStore) error { // old revocation (200d) — pruned
+		return s.recordRevoked(CertRecord{Serial: "oldrevoked", CommonName: "old.example.com",
+			Status: "success", RecordedAt: now.Add(-200 * 24 * time.Hour)})
+	})
+	seed(func(s *certStore) error { // fresh revocation — kept
+		return s.recordRevoked(CertRecord{Serial: "freshrevoked", CommonName: "fresh.example.com",
+			Status: "success", RecordedAt: now.Add(-time.Hour)})
+	})
+	seed(func(s *certStore) error { // stale cache entry (1d left < 7d min validity) — pruned
+		return s.cacheCert(CertRecord{Serial: "stalecache", CommonName: "stale.example.com", SANs: "stale.example.com",
+			IssuedAt: now.Add(-24 * time.Hour), ExpiresAt: now.Add(24 * time.Hour),
+			Status: "success", CertPEM: []byte("pem")})
+	})
+	seed(func(s *certStore) error { // fresh cache entry — kept
+		return s.cacheCert(CertRecord{Serial: "freshcache", CommonName: "fresh.example.com", SANs: "fresh.example.com",
+			IssuedAt: now.Add(-24 * time.Hour), ExpiresAt: now.Add(60 * 24 * time.Hour),
+			Status: "success", CertPEM: []byte("pem")})
+	})
+
+	if err := s.Prune(now); err != nil {
+		t.Fatalf("Prune(): %v", err)
+	}
+
+	if got := len(s.allIssued()); got != 2 {
+		t.Errorf("issued after prune = %d, want 2 (fresh success + fresh failure): %+v", got, s.allIssued())
+	}
+	if got := len(s.allRevoked()); got != 1 {
+		t.Errorf("revoked after prune = %d, want 1", got)
+	}
+	if s.findCachedCert([]string{"stale.example.com"}) != nil {
+		t.Error("stale cache entry should have been pruned")
+	}
+	if s.findCachedCert([]string{"fresh.example.com"}) == nil {
+		t.Error("fresh cache entry should have survived pruning")
+	}
+
+	// Second Prune within 24h is a no-op: a newly-recorded old failure must
+	// survive it.
+	if err := s.recordIssued(CertRecord{CommonName: "another.example.com", Status: "failure",
+		RecordedAt: now.Add(-40 * 24 * time.Hour), Error: "boom"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Prune(now.Add(time.Minute)); err != nil {
+		t.Fatalf("second Prune(): %v", err)
+	}
+	found := false
+	for _, r := range s.allIssued() {
+		if r.CommonName == "another.example.com" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("second Prune within 24h must be a no-op")
+	}
 }
 
 func TestCertStore_AllIssued_ReturnsCopy(t *testing.T) {

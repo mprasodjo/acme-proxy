@@ -1,6 +1,7 @@
 package externalcas
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -166,6 +167,66 @@ func TestCertMetaCollector_Collect_LabelValues(t *testing.T) {
 		return
 	}
 	t.Error("externalcas_certificate_info not found in gathered metrics")
+}
+
+func TestCertMetaCollector_Collect_WindowBound(t *testing.T) {
+	// With more than maxCollectRecords successful issuances, a scrape must
+	// expose only the newest window: exactly maxCollectRecords records per
+	// metric family, and the oldest serials absent.
+	s := newTestStore(t)
+	now := time.Now()
+	const extra = 3
+	for i := 0; i < maxCollectRecords+extra; i++ {
+		if err := s.recordIssued(CertRecord{
+			Serial: fmt.Sprintf("w%05d", i), CommonName: "win.example.com", Issuer: "Test CA",
+			SANs: "win.example.com", IssuedAt: now, ExpiresAt: now.Add(90 * 24 * time.Hour),
+			DurationSeconds: 1, Status: "success",
+		}); err != nil {
+			t.Fatalf("seed %d: %v", i, err)
+		}
+	}
+
+	c := newCertMetaCollector(s)
+	for _, name := range []string{
+		"externalcas_certificate_info",
+		"externalcas_certificate_issued_timestamp_seconds",
+		"externalcas_certificate_expiry_timestamp_seconds",
+		"externalcas_certificate_signing_duration_seconds",
+	} {
+		if n := testutil.CollectAndCount(c, name); n != maxCollectRecords {
+			t.Errorf("CollectAndCount(%q) = %d, want %d", name, n, maxCollectRecords)
+		}
+	}
+
+	// The retained window is the NEWEST one: the first `extra` serials are
+	// gone, the last serial is present.
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(c)
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather(): %v", err)
+	}
+	serials := map[string]bool{}
+	for _, mf := range mfs {
+		if mf.GetName() != "externalcas_certificate_info" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == "serial" {
+					serials[lp.GetValue()] = true
+				}
+			}
+		}
+	}
+	oldest := fmt.Sprintf("w%05d", 0)
+	newest := fmt.Sprintf("w%05d", maxCollectRecords+extra-1)
+	if serials[oldest] {
+		t.Errorf("oldest serial %q emitted, want window to start at %q", oldest, fmt.Sprintf("w%05d", extra))
+	}
+	if !serials[newest] {
+		t.Errorf("newest serial %q missing from collect window", newest)
+	}
 }
 
 func TestStartMetricsServer_Disabled(t *testing.T) {

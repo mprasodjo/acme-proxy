@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"sync"
@@ -65,6 +66,22 @@ func newCertMetaCollector(s *certStore) *certMetaCollector {
 	}
 }
 
+// maxCollectRecords bounds how many issued/revoked records a single scrape
+// may emit. The store's slices grow with the certificate history (capped at
+// thousands of entries); emitting 4+ metrics per record for all of them on
+// every scrape would blow up Prometheus cardinality and scrape time. The
+// slices are chronological (newest last), so only the newest window is kept.
+const maxCollectRecords = 500
+
+// lastRecords returns at most the last n records of a chronological slice
+// (newest last).
+func lastRecords[T any](records []T, n int) []T {
+	if len(records) > n {
+		return records[len(records)-n:]
+	}
+	return records
+}
+
 // Describe sends all metric descriptors to Prometheus.
 func (c *certMetaCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.issuedInfo
@@ -75,8 +92,9 @@ func (c *certMetaCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.revocationDuration
 }
 
-// Collect emits per-certificate metrics for every issued and revoked cert in
-// the sidecar store. Called by Prometheus on each scrape.
+// Collect emits per-certificate metrics for the issued and revoked certs in
+// the sidecar store, newest-first windowed to maxCollectRecords per bucket
+// (see maxCollectRecords). Called by Prometheus on each scrape.
 //
 // Label order for issued metrics:
 //
@@ -90,7 +108,7 @@ func (c *certMetaCollector) Describe(ch chan<- *prometheus.Desc) {
 //	revokedInfo:         serial, common_name, issuer, sans, status
 //	revocationDuration:  serial, common_name, status
 func (c *certMetaCollector) Collect(ch chan<- prometheus.Metric) {
-	for _, r := range c.store.allIssued() {
+	for _, r := range lastRecords(c.store.allIssued(), maxCollectRecords) {
 		// Skip failure records: serial and issuer are empty, so all failures for
 		// the same CN/SAN collapse to identical label sets causing duplicate metric
 		// errors at scrape time. Failures are already counted by
@@ -107,7 +125,7 @@ func (c *certMetaCollector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.expiresAt, prometheus.GaugeValue, float64(r.ExpiresAt.Unix()),
 			r.Serial, r.CommonName)
 	}
-	for _, r := range c.store.allRevoked() {
+	for _, r := range lastRecords(c.store.allRevoked(), maxCollectRecords) {
 		ch <- prometheus.MustNewConstMetric(c.revokedInfo, prometheus.GaugeValue, 1,
 			r.Serial, r.CommonName, r.Issuer, r.SANs, r.Status)
 		ch <- prometheus.MustNewConstMetric(c.revocationDuration, prometheus.GaugeValue, r.DurationSeconds,
@@ -141,7 +159,8 @@ func StartMetricsServer(m metrics, caURL string) error {
 		if port == 0 {
 			port = 9123
 		}
-		addr := ":" + strconv.Itoa(port)
+		// Empty Bind keeps the historical all-interfaces ":port" behaviour.
+		addr := net.JoinHostPort(m.Bind, strconv.Itoa(port))
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
 		go func() {
@@ -150,6 +169,8 @@ func StartMetricsServer(m metrics, caURL string) error {
 				Addr:              addr,
 				Handler:           mux,
 				ReadHeaderTimeout: 10 * time.Second,
+				// Close idle keep-alives before middleboxes forget them.
+				IdleTimeout: 60 * time.Second,
 			}
 			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				slog.Error("metrics server stopped", "error", err)
@@ -163,6 +184,10 @@ func StartMetricsServer(m metrics, caURL string) error {
 // A 2xx response sets the gauge to 1 (up); any error or non-2xx sets it to 0 (down).
 func runCAHealthProbe(initialURL string, interval time.Duration) {
 	client := &http.Client{Timeout: 10 * time.Second}
+	// lastURL tracks the previously exported ca_url label; when the URL
+	// changes (hot reload) the old gauge series is deleted so it cannot
+	// linger as a stale "0" zombie forever.
+	var lastURL string
 	probe := func() {
 		caURL := initialURL
 		// Honor hot-reloaded ca_url.
@@ -170,6 +195,12 @@ func runCAHealthProbe(initialURL string, interval time.Duration) {
 			if u := cas.conf().CaURL; u != "" {
 				caURL = u
 			}
+		}
+		if caURL != lastURL {
+			if lastURL != "" {
+				externalCAStatus.DeleteLabelValues(lastURL)
+			}
+			lastURL = caURL
 		}
 		resp, err := client.Get(caURL) //nolint:noctx
 		if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -214,7 +245,7 @@ var (
 		return r
 	}()
 
-	// Counters — monotonically increasing
+	// Counters
 	certificatesIssuedTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "externalcas_certificates_issued_total",
@@ -231,7 +262,7 @@ var (
 		[]string{"status"},
 	)
 
-	// Histograms — distribution of observed values
+	// Histograms
 	certificateRequestDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name: "externalcas_certificate_request_duration_seconds",
@@ -262,7 +293,7 @@ var (
 		[]string{"status"}, // status: issued, renewed
 	)
 
-	// Gauges — values that can go up or down
+	// Gauges
 	externalCAStatus = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "externalcas_external_ca_up",

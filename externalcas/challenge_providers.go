@@ -53,9 +53,7 @@ func (p *sharedHTTP01Provider) Present(ctx context.Context, domain, token, keyAu
 	if p.listener == nil {
 		ln, err := net.Listen("tcp", p.addr)
 		if err != nil {
-			// Do not cache the failure: the next Present retries the bind
-			// (e.g. the port may have been freed in the meantime) and gets
-			// a clear error instead of a silently unserved challenge.
+			// Not cached: the next Present retries the bind.
 			return fmt.Errorf("could not start HTTP server for challenge: %w", err)
 		}
 		p.listener = ln

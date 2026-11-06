@@ -2,8 +2,8 @@
 // requests. The list lives in a plain text file that is re-read whenever it
 // changes, so edits take effect without restarting the daemon.
 //
-// File format: one entry per line — an IP (192.168.100.1), a CIDR subnet
-// (192.168.100.0/24), or a '#' comment. Blank lines are ignored.
+// File format: one entry per line: an IP, a CIDR subnet, or a '#'
+// comment. Blank lines are ignored.
 package acl
 
 import (

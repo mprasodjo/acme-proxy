@@ -764,7 +764,18 @@ function toast(msg){
 class AuthError extends Error {}
 
 async function api(path, opts){
-  const res = await fetch(path, Object.assign({ credentials:'same-origin', headers:{ 'Accept':'application/json' } }, opts));
+  // Don't let a stalled connection hang fetches forever.
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 10000);
+  let res;
+  try {
+    res = await fetch(path, Object.assign({ credentials:'same-origin', headers:{ 'Accept':'application/json' }, signal: ctl.signal }, opts));
+  } catch(e){
+    if(e && e.name === 'AbortError') throw new Error('request timed out');
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
   if(res.status === 401){ showLogin(); throw new AuthError(); }
   if(!res.ok) throw new Error('HTTP ' + res.status);
   const ct = res.headers.get('Content-Type') || '';
@@ -1349,7 +1360,6 @@ async function saveSettings(){
   save.disabled = true;
   reset.disabled = true;
   save.textContent = 'Saving…';
-  try {
   let res = null, raw = null;
   try{
     const r = await fetch('/api/settings', {

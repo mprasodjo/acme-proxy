@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -172,12 +173,12 @@ func newCertStore(path string) (*certStore, error) {
 	return s, nil
 }
 
-// load reads all records from both buckets into the in-memory caches,
-// and loads cached certificates into the certCache index.
-// Called once at startup so Prometheus scrapes immediately reflect history
-// and cached certificates are available for serving.
+// load reads all records from both buckets into the in-memory caches and
+// loads cached certificates into the certCache index. Stale cache entries
+// are pruned here too (defaults; live config is not known at load time).
 func (s *certStore) load() error {
-	return s.db.View(func(tx *bolt.Tx) error {
+	var staleKeys [][]byte
+	if err := s.db.View(func(tx *bolt.Tx) error {
 		if err := tx.Bucket(issuedBucket).ForEach(func(_, v []byte) error {
 			var r CertRecord
 			if err := json.Unmarshal(v, &r); err != nil {
@@ -198,29 +199,55 @@ func (s *certStore) load() error {
 		}); err != nil {
 			return err
 		}
-		return tx.Bucket(cachedBucket).ForEach(func(_, v []byte) error {
+		return tx.Bucket(cachedBucket).ForEach(func(k, v []byte) error {
 			var r CertRecord
 			if err := json.Unmarshal(v, &r); err != nil {
 				return err
 			}
 			if r.Status == "success" && len(r.CertPEM) > 0 {
+				if !cacheFreshEnough(&r, &acmeProxyConfig{}) {
+					// k is only valid inside the transaction; copy it.
+					staleKeys = append(staleKeys, append([]byte(nil), k...))
+					return nil
+				}
 				key := cacheKey(r.domains())
 				s.certCache[key] = r
 			}
 			return nil
 		})
-	})
+	}); err != nil {
+		return err
+	}
+	if len(staleKeys) > 0 {
+		if err := s.db.Update(func(tx *bolt.Tx) error {
+			for _, k := range staleKeys {
+				if err := tx.Bucket(cachedBucket).Delete(k); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // storeKey returns a stable bbolt key for r.
 // Successful records use the hex serial (globally unique).
 // Failed records have no serial, so a CN + nanosecond timestamp is used so
-// each failed attempt is stored as a distinct entry.
+// each failed attempt is stored as a distinct entry. The timestamp comes
+// from RecordedAt so the key is deterministic (recomputable for eviction);
+// it falls back to the current time only for legacy zero-time records.
 func storeKey(r CertRecord) []byte {
 	if r.Serial != "" {
 		return []byte(r.Serial)
 	}
-	return []byte("failure:" + r.CommonName + ":" + fmt.Sprint(time.Now().UnixNano()))
+	ts := r.RecordedAt
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	return []byte("failure:" + r.CommonName + ":" + fmt.Sprint(ts.UnixNano()))
 }
 
 func (s *certStore) persist(bucket, key []byte, r CertRecord) error {
@@ -239,7 +266,9 @@ const failureRetention = 30 * 24 * time.Hour
 
 // recordIssued persists r to the issued_certs bucket and appends it to the
 // in-memory slice so subsequent Prometheus scrapes pick it up immediately.
-// Failed issuances older than failureRetention are pruned.
+// Failed issuances older than failureRetention are pruned, and the slice is
+// capped at maxHistoryRecords (oldest entries dropped, their bucket keys
+// deleted alongside).
 func (s *certStore) recordIssued(r CertRecord) error {
 	if r.RecordedAt.IsZero() {
 		r.RecordedAt = time.Now().UTC()
@@ -252,13 +281,22 @@ func (s *certStore) recordIssued(r CertRecord) error {
 		s.issued = pruneFailuresLocked(s.issued, time.Now().Add(-failureRetention))
 	}
 	s.issued = append(s.issued, r)
+	var evicted []CertRecord
+	if len(s.issued) > maxHistoryRecords {
+		drop := len(s.issued) - maxHistoryRecords
+		evicted = append(evicted, s.issued[:drop]...)
+		s.issued = append([]CertRecord(nil), s.issued[drop:]...)
+	}
 	s.mu.Unlock()
+	if err := s.deleteKeys(issuedBucket, evicted); err != nil {
+		// In-memory eviction already happened; the orphaned bbolt entries
+		// are removed by the daily prune.
+		slog.Warn("failed to delete evicted issued records from bbolt", "error", err)
+	}
 	return nil
 }
 
-// pruneFailuresLocked drops failure records recorded before the cutoff
-// (normally now minus failureRetention), in place. The bbolt bucket keeps
-// its full history; this bounds the in-memory working set.
+// pruneFailuresLocked drops failure records older than cutoff, in place.
 // Caller must hold s.mu.
 func pruneFailuresLocked(records []CertRecord, cutoff time.Time) []CertRecord {
 	out := records[:0]
@@ -272,7 +310,7 @@ func pruneFailuresLocked(records []CertRecord, cutoff time.Time) []CertRecord {
 }
 
 // recordRevoked persists r to the revoked_certs bucket and appends it to the
-// in-memory slice.
+// in-memory slice (capped at maxHistoryRecords, mirroring recordIssued).
 func (s *certStore) recordRevoked(r CertRecord) error {
 	if r.RecordedAt.IsZero() {
 		r.RecordedAt = time.Now().UTC()
@@ -282,22 +320,94 @@ func (s *certStore) recordRevoked(r CertRecord) error {
 	}
 	s.mu.Lock()
 	s.revoked = append(s.revoked, r)
+	var evicted []CertRecord
+	if len(s.revoked) > maxHistoryRecords {
+		drop := len(s.revoked) - maxHistoryRecords
+		evicted = append(evicted, s.revoked[:drop]...)
+		s.revoked = append([]CertRecord(nil), s.revoked[drop:]...)
+	}
 	s.mu.Unlock()
+	if err := s.deleteKeys(revokedBucket, evicted); err != nil {
+		slog.Warn("failed to delete evicted revoked records from bbolt", "error", err)
+	}
 	return nil
 }
 
+// deleteKeys removes the bucket entries for records evicted from an
+// in-memory history slice. Keys are recomputed with storeKey; failure keys
+// are deterministic because RecordedAt is always set before persisting.
+func (s *certStore) deleteKeys(bucket []byte, records []CertRecord) error {
+	if len(records) == 0 {
+		return nil
+	}
+	keys := make([][]byte, 0, len(records))
+	for _, r := range records {
+		keys = append(keys, storeKey(r))
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		for _, k := range keys {
+			if err := tx.Bucket(bucket).Delete(k); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// maxCachedCerts bounds the cert cache; when full, inserting a new domain
+// set evicts the entry with the oldest expiry.
+const maxCachedCerts = 1000
+
+// maxHistoryRecords bounds the issued/revoked history; evicted entries are
+// deleted from bbolt too.
+const maxHistoryRecords = 5000
+
 // cacheCert stores a successful certificate in the cache bucket and updates
 // the in-memory index. If a cert for the same domains already exists, it is
-// overwritten (only the latest valid cert is kept per domain set).
+// overwritten (only the latest valid cert is kept per domain set). When the
+// cache is at maxCachedCerts, the entry with the oldest ExpiresAt is evicted.
 func (s *certStore) cacheCert(r CertRecord) error {
 	if r.Status != "success" || len(r.CertPEM) == 0 {
 		return nil
 	}
+	if r.RecordedAt.IsZero() {
+		r.RecordedAt = time.Now().UTC()
+	}
 	key := cacheKey(r.domains())
-	if err := s.persist(cachedBucket, []byte(key), r); err != nil {
+
+	// Pick an eviction victim (oldest expiry) before touching anything so a
+	// failed persist leaves the cache untouched.
+	s.mu.Lock()
+	evictKey := ""
+	if _, exists := s.certCache[key]; !exists && len(s.certCache) >= maxCachedCerts {
+		var oldest time.Time
+		first := true
+		for k, rec := range s.certCache {
+			if first || rec.ExpiresAt.Before(oldest) {
+				evictKey, oldest, first = k, rec.ExpiresAt, false
+			}
+		}
+	}
+	s.mu.Unlock()
+
+	if err := s.db.Update(func(tx *bolt.Tx) error {
+		if evictKey != "" {
+			if err := tx.Bucket(cachedBucket).Delete([]byte(evictKey)); err != nil {
+				return err
+			}
+		}
+		data, err := json.Marshal(r)
+		if err != nil {
+			return fmt.Errorf("failed to marshal record: %w", err)
+		}
+		return tx.Bucket(cachedBucket).Put([]byte(key), data)
+	}); err != nil {
 		return err
 	}
 	s.mu.Lock()
+	if evictKey != "" {
+		delete(s.certCache, evictKey)
+	}
 	s.certCache[key] = r
 	s.mu.Unlock()
 	return nil
@@ -321,6 +431,30 @@ func (s *certStore) dropCached(key string) (bool, error) {
 		return true, err
 	}
 	return true, nil
+}
+
+// dropCachedIfStale removes the cache entry for domains when it no longer
+// satisfies the freshness predicate (lookup-time cleanup; best effort).
+func (s *certStore) dropCachedIfStale(domains []string, cfg *acmeProxyConfig) {
+	key := cacheKey(domains)
+	s.mu.Lock()
+	r, ok := s.certCache[key]
+	if ok && cacheFreshEnough(&r, cfg) {
+		s.mu.Unlock()
+		return
+	}
+	if ok {
+		delete(s.certCache, key)
+	}
+	s.mu.Unlock()
+	if !ok {
+		return
+	}
+	if err := s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(cachedBucket).Delete([]byte(key))
+	}); err != nil {
+		slog.Debug("failed to drop stale cache entry", "domains", key, "error", err)
+	}
 }
 
 // findCachedCert looks up a cached certificate covering all requested domains.
@@ -363,6 +497,107 @@ func (s *certStore) allCached() []CertRecord {
 		out = append(out, r)
 	}
 	return out
+}
+
+// allCachedMeta returns a snapshot of all cached records WITHOUT the PEM
+// payload (CertPEM zeroed in the copy) for dashboard aggregation, so
+// building domain maps does not copy megabytes of certificate material.
+func (s *certStore) allCachedMeta() []CertRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]CertRecord, 0, len(s.certCache))
+	for _, r := range s.certCache {
+		r.CertPEM = nil
+		out = append(out, r)
+	}
+	return out
+}
+
+// lastPruneMu guards lastPrune so opportunistic Prune callers run it at
+// most once per 24 hours.
+var (
+	lastPruneMu sync.Mutex
+	lastPrune   time.Time
+)
+
+// Prune deletes retention-expired records from the sidecar store in a single
+// db.Update: issued failures recorded more than 30 days ago, issued/revoked
+// successes older than 180 days, and cached entries that no longer satisfy
+// the freshness predicate. The in-memory slices and cache are rebuilt from
+// what remains. Prune is a no-op when the last run was less than 24 hours
+// ago, so callers may invoke it opportunistically (hourly tick, startup).
+func (s *certStore) Prune(now time.Time) error {
+	lastPruneMu.Lock()
+	if !lastPrune.IsZero() && now.Sub(lastPrune) < 24*time.Hour {
+		lastPruneMu.Unlock()
+		return nil
+	}
+	lastPrune = now
+	lastPruneMu.Unlock()
+
+	failCutoff := now.Add(-failureRetention)
+	successCutoff := now.Add(-180 * 24 * time.Hour)
+
+	var issued, revoked []CertRecord
+	certCache := make(map[string]CertRecord)
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		ib := tx.Bucket(issuedBucket)
+		if err := ib.ForEach(func(k, v []byte) error {
+			var r CertRecord
+			if err := json.Unmarshal(v, &r); err != nil {
+				return err
+			}
+			switch {
+			case r.Status != "success" && !r.RecordedAt.IsZero() && r.RecordedAt.Before(failCutoff):
+				return ib.Delete(k)
+			case r.Status == "success" && !r.IssuedAt.IsZero() && r.IssuedAt.Before(successCutoff):
+				return ib.Delete(k)
+			}
+			issued = append(issued, r)
+			return nil
+		}); err != nil {
+			return err
+		}
+		rb := tx.Bucket(revokedBucket)
+		if err := rb.ForEach(func(k, v []byte) error {
+			var r CertRecord
+			if err := json.Unmarshal(v, &r); err != nil {
+				return err
+			}
+			t := r.RecordedAt
+			if t.IsZero() {
+				t = r.IssuedAt
+			}
+			if !t.IsZero() && t.Before(successCutoff) {
+				return rb.Delete(k)
+			}
+			revoked = append(revoked, r)
+			return nil
+		}); err != nil {
+			return err
+		}
+		cb := tx.Bucket(cachedBucket)
+		return cb.ForEach(func(k, v []byte) error {
+			var r CertRecord
+			if err := json.Unmarshal(v, &r); err != nil {
+				return err
+			}
+			if r.Status == "success" && len(r.CertPEM) > 0 && cacheFreshEnough(&r, &acmeProxyConfig{}) {
+				certCache[cacheKey(r.domains())] = r
+				return nil
+			}
+			return cb.Delete(k)
+		})
+	})
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.issued = issued
+	s.revoked = revoked
+	s.certCache = certCache
+	s.mu.Unlock()
+	return nil
 }
 
 func (s *certStore) close() error {

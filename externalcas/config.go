@@ -23,6 +23,7 @@ type legoConfig struct {
 type metrics struct {
 	Enabled    bool   `json:"enabled,omitempty"`
 	Port       int    `json:"port,omitempty"`
+	Bind       string `json:"bind,omitempty"`
 	DataSource string `json:"dataSource,omitempty"`
 }
 
@@ -34,7 +35,6 @@ type dashboard struct {
 	// Bind IP; empty binds all interfaces.
 	Bind string `json:"bind,omitempty"`
 
-	// Credentials; default to admin/kambing when empty.
 	Username string `json:"username,omitempty"`
 	Password string `json:"password,omitempty"`
 
@@ -50,10 +50,8 @@ type dashboard struct {
 
 	// TLSMaxAgeDays is the maximum age in days of the proxy's own
 	// certificate before it is renewed in the background (optional,
-	// default 30). The certificate on disk is always served — renewal
-	// swaps it atomically once the new one arrives — so restarts and
-	// rate-limit failures never take the dashboard down or issue
-	// needless certificates.
+	// default 30). The on-disk certificate keeps serving until the swap,
+	// so a failed renewal never takes the dashboard down.
 	TLSMaxAgeDays int `json:"tls_max_age_days,omitempty"`
 
 	// Path to the sidecar bbolt store. Defaults to metrics.dataSource.
@@ -184,6 +182,9 @@ func (c *acmeProxyConfig) Validate() error {
 	}
 	if c.TLSALPN01Bind != "" && net.ParseIP(c.TLSALPN01Bind) == nil {
 		return fmt.Errorf("tlsalpn01_bind %q is not a valid IP address", c.TLSALPN01Bind)
+	}
+	if c.Metrics.Bind != "" && net.ParseIP(c.Metrics.Bind) == nil {
+		return fmt.Errorf("metrics bind %q is not a valid IP address", c.Metrics.Bind)
 	}
 
 	if c.MaxConcurrentRequests < 0 {

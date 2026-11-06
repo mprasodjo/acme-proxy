@@ -106,6 +106,55 @@ func TestRestartDashboardListener_SwapsAddress(t *testing.T) {
 	}
 }
 
+// SIGHUP reload re-instantiates the CA; restartDashboardListener must be a
+// no-op when neither the address nor the TLS mode changed, instead of
+// rebinding (which hits EADDRINUSE while the old listener is draining).
+func TestRestartDashboardListener_SameAddrIsNoop(t *testing.T) {
+	oldMux := dashMux
+	dashMux = http.NewServeMux()
+	dashMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok")) //nolint:noctx
+	})
+	t.Cleanup(func() {
+		dashSrvMu.Lock()
+		srv := dashSrv
+		dashSrv = nil
+		dashAddr = ""
+		dashSrvTLS = false
+		dashSrvMu.Unlock()
+		if srv != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			_ = srv.Shutdown(ctx)
+		}
+		dashMux = oldMux
+	})
+
+	d := dashboard{Port: 18446, Bind: "127.0.0.1"}
+	if err := restartDashboardListener(d); err != nil {
+		t.Fatalf("first bind: %v", err)
+	}
+	first := dashSrv
+
+	// Rebind with identical address/TLS mode must keep the SAME server.
+	if err := restartDashboardListener(d); err != nil {
+		t.Fatalf("same-addr rebind: %v", err)
+	}
+	if dashSrv != first {
+		t.Fatal("same addr + same TLS mode must be a no-op, got a new server")
+	}
+
+	// The original listener is still serving.
+	resp, err := http.Get("http://127.0.0.1:18446/") //nolint:noctx
+	if err != nil {
+		t.Fatalf("listener stopped serving after no-op rebind: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+}
+
 func TestSettingsClassificationAllApplied(t *testing.T) {
 	// Previously restart-required keys must now classify as applied.
 	setupSettingsEnv(t)
